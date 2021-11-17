@@ -4,6 +4,7 @@ import uuid
 import argparse
 import sys
 import os
+import time
 from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +17,7 @@ def parse_cmd_line_args():
     parser.add_argument('--toolzip', '-t', help="Memory Capture tool zip file", type=str)
     parser.add_argument('--targetid', '-i', help="ID of the target machine.", type=str)
     parser.add_argument('--role', '-l', help="Role to attach to TempWorkstation", type=str)
+    parser.add_argument('--workami', '-a', help="AMI to use for TempWorkstation", type=str)
 
 
     args = parser.parse_args()
@@ -70,7 +72,7 @@ def build_temp_workstation(role, target_az):
     logging.info("TempWorkstation complete.")
 
 
-def get_az_of_target(target_id, ec2_client):
+def get_target_az(target_id, ec2_client):
     logging.info("Getting AZ of the target system...")
     response = "" 
 
@@ -84,6 +86,24 @@ def get_az_of_target(target_id, ec2_client):
     logging.info(target_az)
 
     return target_az
+
+
+def get_target_subnet(target_id, ec2_client):
+    logging.info("Getting AZ of the target system...")
+    response = "" 
+
+    try:
+        response = ec2_client.describe_instances(InstanceIds=[target_id])
+    except ClientError as e:
+        logging.error(e)
+
+    instance = response["Reservations"][0]['Instances'][0]
+    #logging.info(instance)
+    target_subnet_id = instance['SubnetId']
+    logging.info(target_subnet_id)
+
+    return target_subnet_id
+
 
 
 def get_instance_type_of_target(target_id, ec2_client):
@@ -117,25 +137,63 @@ def get_memory_size_by_instance_type(instance_type, ec2_client):
     return instance_type
 
 
-def get_win_2016_ami_id(ec2_client):
-    logging.info("Getting Windows 2016 AMI ID...")
-    response = "" 
+def create_temp_workstation(ec2_client, target_az, role_name, work_ami_id, subnet_id):
+    logging.info("Creating TempWorksation....")
 
     try:
-        response = ec2_client.describe_images()
+        response = ec2_client.run_instances(
+                ImageId=work_ami_id,
+                InstanceType='t2.micro',
+                Placement={'AvailabilityZone': target_az},
+                MaxCount=1,
+                MinCount=1,
+                SubnetId=subnet_id,
+                IamInstanceProfile={
+                    'Name': role_name
+                },
+                TagSpecifications=[
+                    {
+                        'ResourceType': 'instance',
+                        'Tags': [
+                            {
+                                'Key': 'Name',
+                                'Value': 'TempWorkstation'
+                            }
+                        ]
+                    }
+                ]
+            )
     except ClientError as e:
         logging.error(e)
 
-    logging.info(str(response))
 
-    return instance_type
-
-
-def create_temp_workstation(ec2_client, target_az, role):
-    logging.info("Creating TempWorksation....")
+    workstation_id = response['Instances'][0]['InstanceId']
+    logging.info(workstation_id)
+    return workstation_id
 
 
-def main(profile, region, tool_zip, target_id, role):
+def wait_for_workstation_to_start(temp_workstation_id, ec2_client):
+    logging.info("Waiting for workstation to start...")
+
+    try:
+        while True:
+            response = ec2_client.describe_instance_status(
+                    InstanceIds=[temp_workstation_id])
+            if response['InstanceStatuses']:
+                if response['InstanceStatuses'][0]['InstanceState']['Name'] == 'running':
+                    break
+                else:
+                    time.sleep(2)
+            else:
+                time.sleep(2)
+    except ClientError as e:
+        logging.error(e)
+
+    logging.info('Workstation instance is running.')
+
+
+
+def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
     bucket_prefix = "mem-capture"
 
     session = boto3.Session(region_name=region, profile_name=profile)
@@ -147,12 +205,15 @@ def main(profile, region, tool_zip, target_id, role):
     
     #bucket_name = make_bucket(account_id, region, bucket_prefix, s3_client)
     #upload_tools(tool_zip, bucket_name, s3_client)
-    #target_az = get_az_of_target(target_id, ec2_client)
+    target_az = get_target_az(target_id, ec2_client)
+    target_subnet = get_target_subnet(target_id, ec2_client)
+
     #instance_type = get_instance_type_of_target(target_id, ec2_client)
     #memory_size = get_memory_size_by_instance_type(instance_type, ec2_client)
-    win_2016_ami_id = get_win_2016_ami_id(ec2_client)
 
-    #temp_workstation_id = create_temp_workstation(ec2_client, target_az, role)
+    temp_workstation_id = create_temp_workstation(ec2_client, target_az, role_name, 
+            work_ami_id, target_subnet)
+    wait_for_workstation_to_start(temp_workstation_id, ec2_client)
 
     #delete_bucket(bucket_name, s3_resource)
     
@@ -164,7 +225,8 @@ if __name__ == "__main__":
     region = args.region
     tool_zip = args.toolzip
     target_id = args.targetid
-    role = args.role
+    role_name = args.role
+    work_ami_id = args.workami
 
-    main(profile, region, tool_zip, target_id, role)
+    main(profile, region, tool_zip, target_id, role_name, work_ami_id)
 
