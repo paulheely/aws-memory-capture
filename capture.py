@@ -134,7 +134,7 @@ def get_memory_size_by_instance_type(instance_type, ec2_client):
     memory_size = response['InstanceTypes'][0]['MemoryInfo']['SizeInMiB']
     logging.info(str(memory_size))
 
-    return instance_type
+    return memory_size
 
 
 def create_temp_workstation(ec2_client, target_az, role_name, work_ami_id, subnet_id):
@@ -192,6 +192,23 @@ def wait_for_workstation_to_start(temp_workstation_id, ec2_client):
     logging.info('Workstation instance is running.')
 
 
+def create_workdrive(target_az, work_drive_size, ec2_client):
+    logging.info("Creating WorkDrive...")
+    response = "" 
+
+    try:
+        response = ec2_client.create_volume(
+                AvailabilityZone=target_az,
+                Size=work_drive_size,
+                VolumeType='gp2')
+    except ClientError as e:
+        logging.error(e)
+
+    workdrive_id = response['VolumeId']
+    logging.info(str(workdrive_id))
+
+    return workdrive_id
+
 
 def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
     bucket_prefix = "mem-capture"
@@ -208,12 +225,14 @@ def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
     target_az = get_target_az(target_id, ec2_client)
     target_subnet = get_target_subnet(target_id, ec2_client)
 
-    #instance_type = get_instance_type_of_target(target_id, ec2_client)
-    #memory_size = get_memory_size_by_instance_type(instance_type, ec2_client)
+    instance_type = get_instance_type_of_target(target_id, ec2_client)
+    memory_size = get_memory_size_by_instance_type(instance_type, ec2_client)
+    work_drive_size = int(memory_size / 1024) * 2 + 1 # 2x memory + 1Gib for tools
 
-    temp_workstation_id = create_temp_workstation(ec2_client, target_az, role_name, 
-            work_ami_id, target_subnet)
-    wait_for_workstation_to_start(temp_workstation_id, ec2_client)
+    #temp_workstation_id = create_temp_workstation(ec2_client, target_az, role_name, 
+    #        work_ami_id, target_subnet)
+    #wait_for_workstation_to_start(temp_workstation_id, ec2_client)
+    work_drive_id = create_workdrive(target_az, work_drive_size, ec2_client)
 
     #delete_bucket(bucket_name, s3_resource)
     
