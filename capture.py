@@ -18,6 +18,7 @@ def parse_cmd_line_args():
     parser.add_argument('--targetid', '-i', help="ID of the target machine.", type=str)
     parser.add_argument('--role', '-l', help="Role to attach to TempWorkstation", type=str)
     parser.add_argument('--workami', '-a', help="AMI to use for TempWorkstation", type=str)
+    parser.add_argument('--outputfile', '-o-', help="Output file name", type=str)
 
 
     args = parser.parse_args()
@@ -163,6 +164,9 @@ def create_temp_workstation(ec2_client, target_az, role_name, work_ami_id, subne
                     }
                 ]
             )
+
+        waiter = ec2_client.get_waiter('instance_running')
+        waiter.wait(InstanceIds=[response['Instances'][0]['InstanceId']])
     except ClientError as e:
         logging.error(e)
 
@@ -170,26 +174,6 @@ def create_temp_workstation(ec2_client, target_az, role_name, work_ami_id, subne
     workstation_id = response['Instances'][0]['InstanceId']
     logging.info(workstation_id)
     return workstation_id
-
-
-def wait_for_workstation_to_start(temp_workstation_id, ec2_client):
-    logging.info("Waiting for workstation to start...")
-
-    try:
-        while True:
-            response = ec2_client.describe_instance_status(
-                    InstanceIds=[temp_workstation_id])
-            if response['InstanceStatuses']:
-                if response['InstanceStatuses'][0]['InstanceState']['Name'] == 'running':
-                    break
-                else:
-                    time.sleep(2)
-            else:
-                time.sleep(2)
-    except ClientError as e:
-        logging.error(e)
-
-    logging.info('Workstation instance is running.')
 
 
 def create_workdrive(target_az, work_drive_size, ec2_client):
@@ -201,6 +185,9 @@ def create_workdrive(target_az, work_drive_size, ec2_client):
                 AvailabilityZone=target_az,
                 Size=work_drive_size,
                 VolumeType='gp2')
+
+        waiter = ec2_client.get_waiter('volume_available')
+        waiter.wait(VolumeIds=[response['VolumeId']])
     except ClientError as e:
         logging.error(e)
 
@@ -210,7 +197,96 @@ def create_workdrive(target_az, work_drive_size, ec2_client):
     return workdrive_id
 
 
-def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
+def attach_work_drive_to_system(device_name, system_id, drive_id, ec2_client):
+    logging.info("Attaching volume to system...")
+
+    try:
+        ec2_client.attach_volume(Device=device_name,
+                                 InstanceId=system_id,
+                                 VolumeId=drive_id)
+    except ClientError as e:
+        logging.error(e)
+
+
+def detatch_work_drive_from_system(drive_id, ec2_client):
+    logging.info("Detatching volume from system...")
+
+    try:
+        ec2_client.detach_volume(VolumeId=drive_id)
+
+        waiter = ec2_client.get_waiter('volume_available')
+        waiter.wait(VolumeIds=[drive_id])
+    except ClientError as e:
+        logging.error(e)
+
+
+def delete_work_drive(drive_id, ec2_client):
+    logging.info("Deleting work drive...")
+
+    try:
+        ec2_client.delete_volume(VolumeId=drive_id)
+    except ClientError as e:
+        logging.error(e)
+
+def terminate_temp_workstation(temp_workstation_id, ec2_client):
+    logging.info("Terminating temp workstation...")
+
+    try:
+        ec2_client.terminate_instances(InstanceIds=[temp_workstation_id])
+    except ClientError as e:
+        logging.error(e)
+
+
+def build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client):
+    logging.info("Building work drive...")
+
+    format_raw_drive = """Get-Disk | 
+                          Where PartitionStyle -eq 'RAW' |
+                          Initialize-Disk -PartitionStyle MBR -PassThru |
+                          New-Partition -AssignDriveLetter -UseMaximumSize |
+      Format-Volume -FileSystem NTFS -NewFileSystemLabel "Forensic_Tools" -Confirm:$false"""
+
+
+    try:
+        response = ssm_client.send_command(
+                InstanceIds=[temp_workstation_id],
+                DocumentName="AWS-RunPowerShellScript",
+                Parameters={'commands': [format_raw_drive,
+                                        # assign_drive_letter,
+                                        # copy_tools_from_s3,
+                                        # unmount_drive
+                                         ]},
+                )
+
+        command_id = response['Command']['CommandId']
+        waiter = ssm_client.get_waiter('command_executed')
+        waiter.wait(CommandId=command_id, InstanceId=temp_workstation_id)
+    except ClientError as e:
+        logging.error(e)
+
+
+def wait_for_ssm_agent(instance_id, ssm_client):
+    result = ""
+    while True:
+        try:
+            logging.info("Waiting for SSM agent to activate...")
+            result = ssm_client.describe_instance_information(
+                    InstanceInformationFilterList=[
+                        {
+                            'key': 'InstanceIds',
+                            'valueSet': [instance_id]
+                        }])
+
+            if result['InstanceInformationList']:
+                break
+            else:
+                time.sleep(10)
+        except ClientError as e:
+            logging.error(e)
+
+
+
+def main(profile, region, tool_zip, target_id, role_name, work_ami_id, output_file):
     bucket_prefix = "mem-capture"
 
     session = boto3.Session(region_name=region, profile_name=profile)
@@ -218,10 +294,11 @@ def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
     s3_client = session.client('s3')
     s3_resource = session.resource('s3')
     ec2_client = session.client('ec2')
+    ssm_client = session.client('ssm')
     account_id = get_account_id(sts_client)
     
-    #bucket_name = make_bucket(account_id, region, bucket_prefix, s3_client)
-    #upload_tools(tool_zip, bucket_name, s3_client)
+    bucket_name = make_bucket(account_id, region, bucket_prefix, s3_client)
+    upload_tools(tool_zip, bucket_name, s3_client)
     target_az = get_target_az(target_id, ec2_client)
     target_subnet = get_target_subnet(target_id, ec2_client)
 
@@ -229,12 +306,18 @@ def main(profile, region, tool_zip, target_id, role_name, work_ami_id):
     memory_size = get_memory_size_by_instance_type(instance_type, ec2_client)
     work_drive_size = int(memory_size / 1024) * 2 + 1 # 2x memory + 1Gib for tools
 
-    #temp_workstation_id = create_temp_workstation(ec2_client, target_az, role_name, 
-    #        work_ami_id, target_subnet)
-    #wait_for_workstation_to_start(temp_workstation_id, ec2_client)
+    temp_workstation_id = create_temp_workstation(ec2_client, target_az, role_name, 
+            work_ami_id, target_subnet)
     work_drive_id = create_workdrive(target_az, work_drive_size, ec2_client)
+    attach_work_drive_to_system("/dev/sdh", temp_workstation_id, work_drive_id, ec2_client)
+    wait_for_ssm_agent(temp_workstation_id, ssm_client)
+    build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client)
 
-    #delete_bucket(bucket_name, s3_resource)
+
+    #detatch_work_drive_from_system(work_drive_id, ec2_client)
+    #delete_work_drive(work_drive_id, ec2_client)
+    #terminate_temp_workstation(temp_workstation_id, ec2_client)
+    delete_bucket(bucket_name, s3_resource)
     
 
 
@@ -246,6 +329,7 @@ if __name__ == "__main__":
     target_id = args.targetid
     role_name = args.role
     work_ami_id = args.workami
+    output_file = args.outputfile
 
-    main(profile, region, tool_zip, target_id, role_name, work_ami_id)
+    main(profile, region, tool_zip, target_id, role_name, work_ami_id, output_file)
 
