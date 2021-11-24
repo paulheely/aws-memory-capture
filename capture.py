@@ -9,8 +9,7 @@ from botocore.exceptions import ClientError
 
 logging.basicConfig(level=logging.INFO)
 
-TEMP_INSTANCE_TYPE = "m5.large"
-
+TEMP_INSTANCE_TYPE = "t2.micro"
 
 def parse_cmd_line_args():
     parser = argparse.ArgumentParser()
@@ -206,6 +205,8 @@ def attach_work_drive_to_system(device_name, system_id, drive_id, ec2_client):
         ec2_client.attach_volume(Device=device_name,
                                  InstanceId=system_id,
                                  VolumeId=drive_id)
+        waiter = ec2_client.get_waiter('volume_in_use')
+        waiter.wait(VolumeIds=[drive_id])
     except ClientError as e:
         logging.error(e)
 
@@ -243,25 +244,15 @@ def build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client):
     logging.info("Building work drive...")
 
     format_raw_drive = 'Get-Disk | Where PartitionStyle -eq "RAW" | Initialize-Disk -PartitionStyle MBR -PassThru | New-Partition -AssignDriveLetter -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel "Forensic_Tools" -Confirm:$false'
-
-
     get_drive_letter = '$toolsDrive = (Get-Volume -FileSystemLabel Forensic_Tools).DriveLetter'
-
     get_drive_path = '$toolsDrivePath = $toolsDrive + ":\"'
-
     make_tools_dir = 'New-Item -Path $toolsDrivePath -Name tools -ItemType directory'
-
     make_tools_path = f'$toolsPath = $toolsDrivePath + "tools\{tool_zip}"'
-
     copy_tools_from_s3 = f'Read-S3Object -BucketName {bucket_name} -Key {tool_zip} -File $toolsPath'
-
-    unzip_tools = f'Expand-Archive -LiteralPath $toolsPath -DestinationPath $toolsDrivePath + "\\tools"'
-
+    make_destination_path = '$destinationPath = $toolsDrivePath + "\\tools"'
+    unzip_tools = 'Expand-Archive -LiteralPath $toolsPath -DestinationPath $destinationPath'
     get_disk_number = '$diskNumber = (Get-Partition -DriveLetter $toolsDrive).DiskNumber'
-
     unmount_drive = 'Set-Disk -Number $diskNumber -IsOffLine $True'
-
-    logging.info(copy_tools_from_s3)
 
     try:
         response = ssm_client.send_command(
@@ -273,6 +264,7 @@ def build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client):
                                          make_tools_dir,
                                          make_tools_path,
                                          copy_tools_from_s3,
+                                         make_destination_path,
                                          unzip_tools,
                                          get_disk_number,
                                          unmount_drive
@@ -280,21 +272,27 @@ def build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client):
                             },
                 )
 
-        logging.info(response)
+        logging.info("Waiting for PowerShell commands to complete...")
+
         command_id = response['Command']['CommandId']
         waiter = ssm_client.get_waiter('command_executed')
-        waiter.wait(CommandId=command_id, InstanceId=temp_workstation_id)
+        waiter.wait(CommandId=command_id, 
+            InstanceId=temp_workstation_id,
+            WaiterConfig={
+                'Delay': 10,
+                'MaxAttempts': 100 # on t2.micro the commands fail with default of 20
+            }
+        )
         output = ssm_client.get_command_invocation(
             CommandId=command_id,
-            InstanceId=temp_workstation_id
+            InstanceId=temp_workstation_id,
         )
-        print(output)
     except ClientError as e:
         logging.error(e)
 
 
 def capture_memory_image(workstation_id, ssm_client):
-    logging.info("Building work drive...")
+    logging.info("Capturing memory image...")
 
     take_drive_online = 'Get-Disk | Where-Object IsOffline -Eq $True | Set-Disk -IsOffline $False'
 
@@ -302,23 +300,33 @@ def capture_memory_image(workstation_id, ssm_client):
 
     get_drive_path = '$toolsDrivePath = $toolsDrive + ":\"'
 
-    dump_memory = ''
-
     get_disk_number = '$diskNumber = (Get-Partition -DriveLetter $toolsDrive).DiskNumber'
+
+    make_drive_writeable = 'Set-Disk -Number $disknumber -IsReadOnly $False'
+
+    make_capture_path = '$captureTool = $toolsDrivePath + "\tools\\x64\\RamCapture64.exe"'
+
+    make_dump_path = '$dumpPath = $toolsDrivePath + "\memory_dump.raw"'
+
+    make_dump_cmd = '$dumpCmd = $captureTool + " " + $dumpPath'
+
+    dump_memory = 'Invoke-Expression $dumpCmd'
 
     unmount_drive = 'Set-Disk -Number $diskNumber -IsOffLine $True'
 
-    logging.info(copy_tools_from_s3)
-
     try:
         response = ssm_client.send_command(
-                InstanceIds=[temp_workstation_id],
+                InstanceIds=[workstation_id],
                 DocumentName="AWS-RunPowerShellScript",
                 Parameters={'commands': [take_drive_online,
                                          get_drive_letter,
                                          get_drive_path,
-                                         dump_memory,
                                          get_disk_number,
+                                         make_drive_writeable,
+                                         make_capture_path,
+                                         make_dump_path,
+                                         make_dump_cmd,
+                                         dump_memory,
                                          unmount_drive
                                          ],
                             },
@@ -327,10 +335,16 @@ def capture_memory_image(workstation_id, ssm_client):
         logging.info(response)
         command_id = response['Command']['CommandId']
         waiter = ssm_client.get_waiter('command_executed')
-        waiter.wait(CommandId=command_id, InstanceId=temp_workstation_id)
+        waiter.wait(CommandId=command_id, 
+                InstanceId=workstation_id,
+                WaiterConfig={
+                    'Delay': 10,
+                    'MaxAttempts': 100 # on t2.micro the commands fail with default of 20
+                }
+            )
         output = ssm_client.get_command_invocation(
             CommandId=command_id,
-            InstanceId=temp_workstation_id
+            InstanceId=workstation_id
         )
         print(output)
     except ClientError as e:
@@ -386,7 +400,7 @@ def main(profile, region, tool_zip, target_id, role_name, work_ami_id, output_fi
     build_work_drive(temp_workstation_id, tool_zip, bucket_name, ssm_client)
     detatch_work_drive_from_system(work_drive_id, ec2_client)
     attach_work_drive_to_system("/dev/sdx", target_id, work_drive_id, ec2_client)
-    #capture_memory_image(target_id, ec2_client)
+    capture_memory_image(target_id, ssm_client)
 
 
     #delete_work_drive(work_drive_id, ec2_client)
