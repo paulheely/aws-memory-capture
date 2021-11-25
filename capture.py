@@ -295,23 +295,14 @@ def capture_memory_image(workstation_id, ssm_client):
     logging.info("Capturing memory image...")
 
     take_drive_online = 'Get-Disk | Where-Object IsOffline -Eq $True | Set-Disk -IsOffline $False'
-
     get_drive_letter = '$toolsDrive = (Get-Volume -FileSystemLabel Forensic_Tools).DriveLetter'
-
     get_drive_path = '$toolsDrivePath = $toolsDrive + ":\"'
-
     get_disk_number = '$diskNumber = (Get-Partition -DriveLetter $toolsDrive).DiskNumber'
-
     make_drive_writeable = 'Set-Disk -Number $disknumber -IsReadOnly $False'
-
-    make_capture_path = '$captureTool = $toolsDrivePath + "\tools\\x64\\RamCapture64.exe"'
-
+    make_capture_path = '$captureTool = $toolsDrivePath + "tools\\x64\\RamCapture64.exe"'
     make_dump_path = '$dumpPath = $toolsDrivePath + "\memory_dump.raw"'
-
     make_dump_cmd = '$dumpCmd = $captureTool + " " + $dumpPath'
-
     dump_memory = 'Invoke-Expression $dumpCmd'
-
     unmount_drive = 'Set-Disk -Number $diskNumber -IsOffLine $True'
 
     try:
@@ -332,7 +323,8 @@ def capture_memory_image(workstation_id, ssm_client):
                             },
                 )
 
-        logging.info(response)
+        logging.info("Waiting for PowerShell commands to complete...")
+
         command_id = response['Command']['CommandId']
         waiter = ssm_client.get_waiter('command_executed')
         waiter.wait(CommandId=command_id, 
@@ -346,7 +338,6 @@ def capture_memory_image(workstation_id, ssm_client):
             CommandId=command_id,
             InstanceId=workstation_id
         )
-        print(output)
     except ClientError as e:
         logging.error(e)
 
@@ -370,6 +361,63 @@ def wait_for_ssm_agent(instance_id, ssm_client):
         except ClientError as e:
             logging.error(e)
 
+
+def copy_memory_dump_to_s3(temp_workstation_id, bucket_name, ssm_client):
+    logging.info("Copying memory dump to S3 bucket...")
+
+    take_drive_online = 'Get-Disk | Where-Object IsOffline -Eq $True | Set-Disk -IsOffline $False'
+    get_drive_letter = '$toolsDrive = (Get-Volume -FileSystemLabel Forensic_Tools).DriveLetter'
+    get_drive_path = '$toolsDrivePath = $toolsDrive + ":\"'
+    make_memory_dump_file = '$memoryDumpFile = $toolsDrivePath + "memory_dump.raw"'
+    copy_memory_dump_to_s3_cmd = f'$memDumpCmd = "Write-S3Object -BucketName {bucket_name} -Key memory_dump.raw -File $memoryDumpFile"'
+    save_mem_dump_cmd = 'echo $memDumpCmd > c:\mem_dump.txt'
+    copy_memory_dump_to_s3 = 'Invoke-Expression $memDumpCmd'
+    unmount_drive = 'Set-Disk -Number $diskNumber -IsOffLine $True'
+
+    try:
+        response = ssm_client.send_command(
+                InstanceIds=[temp_workstation_id],
+                DocumentName="AWS-RunPowerShellScript",
+                Parameters={'commands': [take_drive_online,
+                                         get_drive_letter,
+                                         get_drive_path,
+                                         make_memory_dump_file,
+                                         copy_memory_dump_to_s3_cmd,
+                                         save_mem_dump_cmd,
+                                         copy_memory_dump_to_s3,
+                                         unmount_drive
+                                         ],
+                            },
+                )
+
+        logging.info("Waiting for PowerShell commands to complete...")
+
+        command_id = response['Command']['CommandId']
+        waiter = ssm_client.get_waiter('command_executed')
+        waiter.wait(CommandId=command_id, 
+                InstanceId=temp_workstation_id,
+                WaiterConfig={
+                    'Delay': 10,
+                    'MaxAttempts': 100 # on t2.micro the commands fail with default of 20
+                }
+            )
+        output = ssm_client.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=temp_workstation_id
+        )
+    except ClientError as e:
+        logging.error(e)
+
+
+def download_memory_dump_from_s3(bucket_name, output_file, s3_client):
+    logging.info("Downloading memory dump from S3...")
+
+    try:
+        s3_client.download_file(bucket_name, 'memory_dump.raw', output_file)
+    except ClientError as e:
+        logging.error(e)
+
+    logging.info("Memory dump  download compete")
 
 
 def main(profile, region, tool_zip, target_id, role_name, work_ami_id, output_file):
@@ -401,10 +449,13 @@ def main(profile, region, tool_zip, target_id, role_name, work_ami_id, output_fi
     detatch_work_drive_from_system(work_drive_id, ec2_client)
     attach_work_drive_to_system("/dev/sdx", target_id, work_drive_id, ec2_client)
     capture_memory_image(target_id, ssm_client)
-
-
-    #delete_work_drive(work_drive_id, ec2_client)
+    detatch_work_drive_from_system(work_drive_id, ec2_client)
+    attach_work_drive_to_system("/dev/sdh", temp_workstation_id, work_drive_id, ec2_client)
+    copy_memory_dump_to_s3(temp_workstation_id, bucket_name, ssm_client)
+    detatch_work_drive_from_system(work_drive_id, ec2_client)
+    delete_work_drive(work_drive_id, ec2_client)
     terminate_temp_workstation(temp_workstation_id, ec2_client)
+    download_memory_dump_from_s3(bucket_name, output_file, s3_client)
     delete_bucket(bucket_name, s3_resource)
     
 
