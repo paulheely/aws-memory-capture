@@ -38,3 +38,10 @@ options:
   --outputfile OUTPUTFILE, -o- OUTPUTFILE
                         Output file name
 ```
+
+
+# Example
+```
+cd <TOOLS FOLDER>
+python C:\Users\paul\projects\aws-memory-capture\capture.py --profile prod-app --region us-east-1 --toolzip RamCapturer.zip --targetid i-018f088f8bda9fd1f --role MemoryCapture --workami ami-0da7a37366e7ee5f0 --outputfile memory.raw
+```
